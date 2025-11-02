@@ -3,10 +3,11 @@ import re
 import time
 from http import HTTPStatus
 from json import JSONDecodeError
-from typing import Optional, Any, Union
+from typing import Optional, Tuple, Any, Union, Coroutine
 
 import jwt
-import requests
+import asyncio
+import aiohttp
 
 from .cache import Cache
 
@@ -55,14 +56,10 @@ class Preston:
     OPERATION_ID_KEY = "operationId"
     VAR_REPLACE_REGEX = r"{(\w+)}"
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, **kwargs: Any):
         self.cache = Cache()
         self.spec = None
         self.version = kwargs.get("version", "latest")
-        self.session = requests.Session()
-        self.session.headers.update(
-            {"User-Agent": kwargs.get("user_agent", ""), "Accept": "application/json"}
-        )
         self.timeout = kwargs.get("timeout", 6)
         self.retries = kwargs.get("retries", 4)
         self.client_id = kwargs.get("client_id")
@@ -84,16 +81,39 @@ class Preston:
         self.refresh_token_callback = kwargs.get("refresh_token_callback")
         self.stored_headers = []
         self._kwargs = kwargs
-        if not kwargs.get("no_update_token", False):
-            self._try_refresh_access_token()
+        self.session = None
 
-    def _retry_request(
+    async def _make_session(self):
+        """Async portion of initialization, to be called first in async functions"""
+
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+            self.session.headers.update(
+                {"User-Agent": self._kwargs.get("user_agent", ""), "Accept": "application/json"}
+            )
+
+    async def _close(self):
+        if not self.session.closed:
+            await self.session.close()
+
+    def __del__(self):
+        try:
+            if not self.session.closed:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self._close())
+                else:
+                    loop.run_until_complete(self._close())
+        except AttributeError:
+            pass
+
+    async def _retry_request(
         self,
         requests_function: callable,
         target_url: str,
         return_metadata=False,
         **kwargs,
-    ) -> dict | tuple[dict, dict, str] | Any:
+    ) -> Coroutine:
         """
 
         Tries some request with exponential backoff on server-side failures.
@@ -108,35 +128,39 @@ class Preston:
         Returns:
             new response
         Raises:
-            requests.exceptions.HTTPError (for client-side errors)
-            requests.exceptions.ConnectionError (for connection errors)
+            aiohttp.ClientResponseError (for client-side errors)
+            aiohttp.ClientConnectionError (for connection errors)
         """
 
         for x in range(self.retries):
             try:
-                resp = requests_function(target_url, **kwargs, timeout=self.timeout)
-                resp.raise_for_status()
-                if return_metadata:
-                    return resp.json(), resp.headers, resp.url
-                if resp.text:
-                    return resp.json()
-                return None
+                async with requests_function(target_url, **kwargs, timeout=self.timeout) as resp:
+                    resp.raise_for_status()
+                    if await resp.text():
+                        json_data = await resp.json()
+                    else:
+                        json_data = None
+
+                    if return_metadata:
+                        return json_data, resp.headers, resp.url
+                    return json_data
 
             except TimeoutError:
                 pass  # Just try again
 
             except JSONDecodeError:
-                pass  # Message was not completed Just try again
+                pass  # Message was not completed. Just try again
 
-            except requests.exceptions.HTTPError as exc:
-                code = exc.response.status_code
+            except aiohttp.ClientPayloadError:
+                pass  # Message was not completed. Just try again
+
+            except aiohttp.ClientResponseError as exc:
+                code = exc.status
                 if code in [
                     HTTPStatus.TOO_MANY_REQUESTS,
                     420,  # Enhance your calm, ESI Error limit
                 ]:
-                    time.sleep(
-                        int(exc.response.headers.get("X-Esi-Error-Limit-Reset", 0))
-                    )
+                    await asyncio.sleep(int(exc.response.headers.get("X-Esi-Error-Limit-Reset", 0)))
                 elif code not in [
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     HTTPStatus.BAD_GATEWAY,
@@ -144,16 +168,14 @@ class Preston:
                     HTTPStatus.GATEWAY_TIMEOUT,
                 ]:
                     raise
-            except requests.exceptions.ReadTimeout:
-                pass  # Timeout triggered, just try again
 
-            except requests.exceptions.ConnectionError:
+            except aiohttp.ClientConnectionError:
                 raise  # No internet, raise immediately without retry
 
             # Exponential Backoff
-            time.sleep(2**x)
+            await asyncio.sleep(2 ** x)
 
-        raise requests.exceptions.ConnectionError("ESI could not complete the request.")
+        raise aiohttp.ClientConnectionError("ESI could not complete the request.")
 
     def copy(self) -> "Preston":
         """Creates a copy of this Preston object.
@@ -189,7 +211,7 @@ class Preston:
         headers = {"Authorization": auth}
         return headers
 
-    def _try_refresh_access_token(self) -> None:
+    async def _try_refresh_access_token(self):
         """Attempts to get a new access token using the refresh token, if needed.
 
         If the access token is expired and this instance has a stored refresh token,
@@ -204,6 +226,8 @@ class Preston:
         Returns:
             None
         """
+        await self._make_session()
+
         if self.refresh_token:
             if not self.access_token or self._is_access_token_expired():
                 headers = {
@@ -216,7 +240,7 @@ class Preston:
                     "client_id": self.client_id,
                 }
 
-                response_data = self._retry_request(
+                response_data = await self._retry_request(
                     self.session.post,
                     self.TOKEN_URL,
                     headers=headers,
@@ -229,7 +253,8 @@ class Preston:
                     "refresh_token", self.refresh_token
                 )
                 if self.refresh_token_callback is not None:
-                    self.refresh_token_callback(self)
+                    await self.refresh_token_callback(self)
+
         if self.access_token:
             self.session.headers.update(
                 {"Authorization": f"Bearer {self.access_token}"}
@@ -264,7 +289,7 @@ class Preston:
             f"&client_id={self.client_id}&scope={self.scope.replace(' ', '%20')}&state={state}"
         )
 
-    def authenticate(self, code: str) -> "Preston":
+    async def authenticate(self, code: str) -> "Preston":
         """Authenticates using the code from the EVE SSO.
 
         A new Preston object is returned; this object is not modified.
@@ -290,7 +315,8 @@ class Preston:
             "client_id": self.client_id,
         }
 
-        response_data = self._retry_request(
+        await self._make_session()
+        response_data = await self._retry_request(
             self.session.post,
             self.TOKEN_URL,
             headers=headers,
@@ -306,7 +332,7 @@ class Preston:
 
         return Preston(**new_kwargs)
 
-    def authenticate_from_token(self, refresh_token) -> "Preston":
+    async def authenticate_from_token(self, refresh_token) -> "Preston":
         """Authenticates usign a stored refresh token.
 
         A new Preston object is returned; this object is not modified.
@@ -331,7 +357,7 @@ class Preston:
         new_kwargs["access_token"] = None
         return Preston(**new_kwargs)
 
-    def _get_spec(self) -> dict:
+    async def _get_spec(self) -> dict:
         """Fetches the OpenAPI spec from the server.
 
         If the spec has already been fetched, the cached version is returned instead.
@@ -344,12 +370,14 @@ class Preston:
         """
         if self.spec:
             return self.spec
-        self.spec = self._retry_request(
-            requests.get, self.SPEC_URL.format(self.version)
+
+        await self._make_session()
+        self.spec = await self._retry_request(
+            self.session.get, self.SPEC_URL.format(self.version)
         )
         return self.spec
 
-    def _get_path_for_op_id(self, op_id: str) -> Optional[str]:
+    async def _get_path_for_op_id(self, op_id: str) -> Optional[str]:
         """Searches the spec for a path matching the operation id.
 
         Args:
@@ -358,7 +386,8 @@ class Preston:
         Returns:
             path to the endpoint, or `None` if not found
         """
-        for path_key, path_value in self._get_spec()["paths"].items():
+        spec = await self._get_spec()
+        for path_key, path_value in spec["paths"].items():
             for method in self.METHODS:
                 if method in path_value:
                     if self.OPERATION_ID_KEY in path_value[method]:
@@ -396,16 +425,12 @@ class Preston:
         Returns:
             url
         """
-        path, inserts = self._insert_vars(path, data)
-        target_url = self.BASE_URL + path
-        if len(inserts) > 0:
-            req = requests.models.PreparedRequest()
-            req.prepare_url(target_url, inserts)
-            return req.url
+        path, query_params = self._insert_vars(path, data)
+        target_url = f"{self.BASE_URL}{path}"
 
         return target_url
 
-    def whoami(self) -> dict:
+    async def whoami(self) -> dict:
         """Returns the basic information about the authenticated character.
 
         Obviously doesn't do anything if this Preston instance is not
@@ -418,18 +443,18 @@ class Preston:
             character info if authenticated, otherwise an empty dict
         """
 
+        await self._try_refresh_access_token()
+
         if not self.access_token:
             return {}
-
-        self._try_refresh_access_token()
 
         try:
             # Get the JWT header to determine the key ID (kid)
             unverified_header = jwt.get_unverified_header(self.access_token)
 
             # Fetch the public keys (JWKS)
-            jwks_response = requests.get(self.JWKS_URL)
-            jwks = jwks_response.json()
+            async with self.session.get(self.JWKS_URL) as jwks_response:
+                jwks = await jwks_response.json()
 
             # Find the public key with matching kid
             key = next(
@@ -463,7 +488,7 @@ class Preston:
             print(f"[whoami] Failed to decode/verify JWT: {e}")
             return {}
 
-    def get_path(self, path: str, data: dict) -> dict:
+    async def get_path(self, path: str, data: dict) -> dict:
         """Queries the ESI by an endpoint URL.
 
         This method is not marked "private" as it _can_ be used
@@ -482,16 +507,16 @@ class Preston:
         cached_data = self.cache.check(target_url)
         if cached_data:
             return cached_data
-        self._try_refresh_access_token()
+        await self._try_refresh_access_token()
 
-        data, headers, url = self._retry_request(
+        data, headers, url = await self._retry_request(
             self.session.get, target_url, return_metadata=True
         )
         self.cache.set(data, headers, url)
         self.stored_headers.insert(0, headers)
         return data
 
-    def get_op(self, op_id: str, **kwargs: str) -> dict:
+    async def get_op(self, op_id: str, **kwargs: str) -> dict:
         """Queries the ESI by looking up an operation id.
 
         Endpoints are cached, so calls to this method for the
@@ -508,11 +533,11 @@ class Preston:
         Returns:
             ESI data
         """
-        path = self._get_path_for_op_id(op_id)
-        return self.get_path(path, kwargs)
+        path = await self._get_path_for_op_id(op_id)
+        return await self.get_path(path, kwargs)
 
-    def post_path(
-        self, path: str, path_data: Union[dict, None], post_data: Any
+    async def post_path(
+            self, path: str, path_data: Union[dict, None], post_data: Any
     ) -> dict:
         """Modifies the ESI by an endpoint URL.
 
@@ -529,10 +554,10 @@ class Preston:
             ESI data
         """
         target_url = self._build_url(path, path_data)
-        self._try_refresh_access_token()
-        return self._retry_request(self.session.post, target_url, json=post_data)
+        await self._try_refresh_access_token()
+        return await self._retry_request(self.session.post, target_url, json=post_data)
 
-    def post_op(self, op_id: str, path_data: Union[dict, None], post_data: Any) -> dict:
+    async def post_op(self, op_id: str, path_data: Union[dict, None], post_data: Any) -> dict:
         """Modifies the ESI by looking up an operation id.
 
         Args:
@@ -543,10 +568,10 @@ class Preston:
         Returns:
             ESI data
         """
-        path = self._get_path_for_op_id(op_id)
-        return self.post_path(path, path_data, post_data)
+        path = await self._get_path_for_op_id(op_id)
+        return await self.post_path(path, path_data, post_data)
 
-    def delete_path(self, path: str, path_data: Union[dict, None]) -> dict:
+    async def delete_path(self, path: str, path_data: Union[dict, None]) -> dict:
         """Deletes a resource in the ESI by an endpoint URL.
 
         This method is not marked "private" as it _can_ be used
@@ -561,10 +586,10 @@ class Preston:
             ESI response data
         """
         target_url = self._build_url(path, path_data)
-        self._try_refresh_access_token()
-        return self._retry_request(self.session.delete, target_url)
+        await self._try_refresh_access_token()
+        return await self._retry_request(self.session.delete, target_url)
 
-    def delete_op(self, op_id: str, path_data: Union[dict, None]) -> dict:
+    async def delete_op(self, op_id: str, path_data: Union[dict, None]) -> dict:
         """Deletes a resource in the ESI by looking up an operation id.
 
         Args:
@@ -574,5 +599,5 @@ class Preston:
         Returns:
             ESI response data
         """
-        path = self._get_path_for_op_id(op_id)
-        return self.delete_path(path, path_data)
+        path = await self._get_path_for_op_id(op_id)
+        return await self.delete_path(path, path_data)
