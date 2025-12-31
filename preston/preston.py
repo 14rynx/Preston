@@ -160,7 +160,7 @@ class Preston:
                     HTTPStatus.TOO_MANY_REQUESTS,
                     420,  # Enhance your calm, ESI Error limit
                 ]:
-                    await asyncio.sleep(int(exc.response.headers.get("X-Esi-Error-Limit-Reset", 0)))
+                    await asyncio.sleep(int(exc.headers.get("X-Esi-Error-Limit-Reset", 0)))
                 elif code not in [
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     HTTPStatus.BAD_GATEWAY,
