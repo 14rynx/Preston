@@ -4,6 +4,7 @@ import time
 from http import HTTPStatus
 from json import JSONDecodeError
 from typing import Optional, Tuple, Any, Union, Coroutine
+from urllib.parse import urlencode
 
 import jwt
 import asyncio
@@ -52,7 +53,7 @@ class Preston:
     JWKS_URL = ISSUER + "/oauth/jwks"
     TOKEN_URL = OAUTH_URL + "/token"
     AUTHORIZE_URL = OAUTH_URL + "/authorize"
-    METHODS = ["get", "post", "put", "delete"]
+    METHODS = ["get", "post", "put", "delete", "patch"]
     OPERATION_ID_KEY = "operationId"
     VAR_REPLACE_REGEX = r"{(\w+)}"
 
@@ -387,12 +388,12 @@ class Preston:
             path to the endpoint, or `None` if not found
         """
         spec = await self._get_spec()
-        for path_key, path_value in spec["paths"].items():
-            for method in self.METHODS:
-                if method in path_value:
-                    if self.OPERATION_ID_KEY in path_value[method]:
-                        if path_value[method][self.OPERATION_ID_KEY] == op_id:
-                            return path_key
+        for path_key, path_value in spec.get("paths", {}).items():
+            if isinstance(path_value, dict):
+                for method in self.METHODS:
+                    method_obj = path_value.get(method)
+                    if isinstance(method_obj, dict) and method_obj.get(self.OPERATION_ID_KEY) == op_id:
+                        return path_key
         return None
 
     def _insert_vars(self, path: str, data: dict) -> tuple[str, dict]:
@@ -406,7 +407,7 @@ class Preston:
             tuple of the path with variables filled, and
             and remaining, unused dict items
         """
-        data = data.copy()
+        data = (data or {}).copy()
         while True:
             match = re.search(self.VAR_REPLACE_REGEX, path)
             if not match:
@@ -425,8 +426,11 @@ class Preston:
         Returns:
             url
         """
+
         path, query_params = self._insert_vars(path, data)
         target_url = f"{self.BASE_URL}{path}"
+        if query_params:
+            target_url += f"?{urlencode(query_params)}"
 
         return target_url
 
