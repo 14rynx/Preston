@@ -9,8 +9,14 @@ from urllib.parse import urlencode
 import jwt
 import asyncio
 import aiohttp
+import logging
 
 from .cache import Cache
+
+
+def _snake_to_pascal(op_id: str) -> str:
+    """Converts legacy snake_case operation IDs to OpenAPI v3 PascalCase."""
+    return "".join(word.capitalize() for word in op_id.split("_"))
 
 
 class Preston:
@@ -379,21 +385,32 @@ class Preston:
         return self.spec
 
     async def _get_path_for_op_id(self, op_id: str) -> Optional[str]:
-        """Searches the spec for a path matching the operation id.
-
-        Args:
-            op_id: operation id
-
-        Returns:
-            path to the endpoint, or `None` if not found
-        """
         spec = await self._get_spec()
-        for path_key, path_value in spec.get("paths", {}).items():
+        paths = spec.get("paths", {})
+
+        # 1. Try exact match first
+        for path_key, path_value in paths.items():
             if isinstance(path_value, dict):
                 for method in self.METHODS:
                     method_obj = path_value.get(method)
                     if isinstance(method_obj, dict) and method_obj.get(self.OPERATION_ID_KEY) == op_id:
                         return path_key
+
+        # 2. Fallback: Try converted PascalCase match
+        pascal_op_id = _snake_to_pascal(op_id)
+        if pascal_op_id != op_id:
+            for path_key, path_value in paths.items():
+                if isinstance(path_value, dict):
+                    for method in self.METHODS:
+                        method_obj = path_value.get(method)
+                        if isinstance(method_obj, dict) and method_obj.get(self.OPERATION_ID_KEY) == pascal_op_id:
+                            logging.warning(
+                                f"[Preston Migration Warning] Deprecated operationId '{op_id}' used. "
+                                f"Auto-converted to '{pascal_op_id}'. Update your call to use '{pascal_op_id}' "
+                                f"or get_path('{path_key}')."
+                            )
+                            return path_key
+
         return None
 
     def _insert_vars(self, path: str, data: dict) -> tuple[str, dict]:
