@@ -46,7 +46,7 @@ class Preston:
     """
 
     BASE_URL = "https://esi.evetech.net"
-    SPEC_URL = BASE_URL + "/_{}/swagger.json"
+    SPEC_URL = BASE_URL + "/{}/openapi.json"
     ISSUER = "https://login.eveonline.com"
     OAUTH_URL = ISSUER + "/v2/oauth"
     JWKS_URL = ISSUER + "/oauth/jwks"
