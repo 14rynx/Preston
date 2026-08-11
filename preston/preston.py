@@ -59,7 +59,7 @@ class Preston:
     def __init__(self, **kwargs: Any):
         self.cache = Cache()
         self.spec = None
-        self.version = kwargs.get("version", "latest")
+        self.version = kwargs.get("version", "meta")
         self.timeout = kwargs.get("timeout", 6)
         self.retries = kwargs.get("retries", 4)
         self.client_id = kwargs.get("client_id")
