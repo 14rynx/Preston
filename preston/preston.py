@@ -538,6 +538,8 @@ class Preston:
             ESI data
         """
         path = await self._get_path_for_op_id(op_id)
+        if not path:
+            raise ValueError(f"Operation ID '{op_id}' was not found in the ESI spec.")
         return await self.get_path(path, kwargs)
 
     async def post_path(
@@ -573,6 +575,8 @@ class Preston:
             ESI data
         """
         path = await self._get_path_for_op_id(op_id)
+        if not path:
+            raise ValueError(f"Operation ID '{op_id}' was not found in the ESI spec.")
         return await self.post_path(path, path_data, post_data)
 
     async def delete_path(self, path: str, path_data: Union[dict, None]) -> dict:
@@ -604,4 +608,6 @@ class Preston:
             ESI response data
         """
         path = await self._get_path_for_op_id(op_id)
+        if not path:
+            raise ValueError(f"Operation ID '{op_id}' was not found in the ESI spec.")
         return await self.delete_path(path, path_data)
