@@ -359,10 +359,18 @@ class Preston:
                 "You have passed in a legacy token, these are no longer supported by CCP!"
             )
 
+        # Ensure parent object has fetched the spec if it hasn't already to avoid duplicate fetches
+        if getattr(self, "spec", None) is None:
+            await self._get_spec()
+
         new_kwargs = dict(self._kwargs)
         new_kwargs["refresh_token"] = refresh_token
         new_kwargs["access_token"] = None
-        return Preston(**new_kwargs)
+
+        # Create the instance and pass down the cached spec
+        new_preston = Preston(**new_kwargs)
+        new_preston.spec = self.spec
+        return new_preston
 
     async def _get_spec(self) -> dict:
         """Fetches the OpenAPI spec from the server.
